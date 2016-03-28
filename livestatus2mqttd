@@ -1,0 +1,374 @@
+#!/usr/bin/perl
+
+# livestatus2mqtt - Check_MK livestatus to MQTT gateway
+#
+# Authors:
+#   Thomas Liske <liske@ibh.de>
+#
+# Copyright Holder:
+#   2016 (C) IBH IT-Service GmbH [https://github.com/DE-IBH/livestatus2mqtt/]
+#
+# License:
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this package; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+
+use warnings;
+use strict;
+
+use AnyEvent;
+use AnyEvent::MQTT;
+use AnyEvent::Socket;
+use JSON;
+use Linux::Inotify2;
+use Log::Dispatch;
+use Log::Dispatch::Screen;
+use Log::Dispatch::Syslog;
+use Getopt::Std;
+use Proc::PID::File;
+use Sys::Hostname;
+
+#die "Daemon already running!\n" if(Proc::PID::File->running(verify => 1));
+
+# logging stuff
+my $logfmt = sub {
+    my %p = @_;
+    return "[$p{level}] $p{message}\n";
+};
+my $logger = Log::Dispatch->new(callbacks => $logfmt);
+
+END {
+    $logger->notice('terminated') if(defined($logger));
+};
+
+my %conf = (
+    connections => {
+	q(localhost) => q(localhost),
+    },
+    base_topic => q(livestatus),
+    interval => 20,
+);
+
+my %cols_conf = (
+    services => [qw(
+acknowledged
+host_icon_image
+host_name
+icon_image
+display_name
+current_attempt
+max_check_attempts
+state last
+state_change
+plugin_output
+    )],
+
+    status => [qw(
+connections_rate
+external_commands_rate
+forks_rate
+host_checks_rate
+interval_length
+livestatus_threads
+livestatus_version
+log_messages_rate
+num_hosts
+num_services
+program_start
+program_version
+requests_rate
+service_checks_rate
+    )],
+
+    hosts => [qw(
+acknowledged
+icon_image
+name
+display_name
+current_attempt
+max_check_attempts
+state
+last_state_change
+plugin_output
+    )],
+    );
+
+my %query_conf = (
+    services => {
+	cols => $cols_conf{services},
+	req => q(GET services
+Filter: state > 0
+Columns: ).join(' ', @{ $cols_conf{services} }).q(
+OutputFormat: json
+KeepAlive: on
+ResponseHeader: fixed16
+
+)
+    },
+
+    status => {
+	cols => $cols_conf{status},
+	req => q(GET status
+Columns: ).join(' ', @{ $cols_conf{status} }).q(
+OutputFormat: json
+KeepAlive: on
+ResponseHeader: fixed16
+
+),
+    },
+
+    hosts => {
+	cols => $cols_conf{hosts},
+	req => q(GET hosts
+Filter: state > 0
+Columns: ).join(' ', @{ $cols_conf{hosts} }).q(
+OutputFormat: json
+KeepAlive: on
+ResponseHeader: fixed16
+
+),
+    },
+    );
+
+my $w_reconn;
+my $mqtt;
+my %mqtt_conf = (
+    host => q(localhost),
+
+    will_topic => join('/', $conf{base_topic}, q(daemons), hostname),
+    will_retain => 1,
+    will_message => encode_json({
+	state => q(dead),
+    }),
+
+    client_id => q(livestatus2mqtt_).hostname,
+
+    on_error => sub {
+	my ($fatal, $message) = @_;
+
+	if($fatal) {
+	    $logger->error("MQTT $message");
+	}
+	else {
+	    $logger->warning("MQTT $message");
+	}
+
+	if($fatal) {
+	    $mqtt->cleanup;
+	    $mqtt = undef;
+	    $w_reconn = AnyEvent->timer(
+		after => 20,
+		cb => \&connect_mqtt,
+	    );
+	}
+    },
+);
+
+
+$logger->add(
+    Log::Dispatch::Screen->new(
+	name => 'console',
+	min_level => 'notice',
+    )
+);
+$logger->add(
+    Log::Dispatch::Syslog->new(
+	name => 'syslog',
+	min_level => 'info',
+	ident => 'nag2mqttd',
+	logopt => 'pid',
+	facility => 'user',
+    )
+);
+
+sub HELP_MESSAGE {
+    print <<USG;
+Usage:
+
+  livestatus2mqttd [-v] [-c <cfg>]
+
+    -v		be more verbose
+    -c <cfg>	config filename
+
+    --help      show this help
+    --version   show version information
+
+USG
+}
+
+sub VERSION_MESSAGE {
+    print <<LIC;
+
+livestatus2mqtt - Check_MK livestatus to MQTT gateway
+
+Authors:
+  Thomas Liske <liske\@ibh.de>
+
+Copyright Holder:
+  2016 (C) IBH IT-Service GmbH [https://github.com/DE-IBH/livestatus2mqtt/]
+
+License:
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+LIC
+#/
+}
+
+our $opt_c = '/etc/livestatus2mqtt/livestatus2mqtt.conf';
+our $opt_v;
+unless(getopts('c:v')) {
+    HELP_MESSAGE;
+    exit 1;
+}
+
+eval do { local(@ARGV, $/) = $opt_c; <> || ''};
+die "Error reading $opt_c: $!\n" if($!);
+die "Error parsing $opt_c: $@\n" if($@);
+
+
+my %cv = (
+    quit => AnyEvent->condvar,
+);
+
+
+sub connect_mqtt {
+    $mqtt = AnyEvent::MQTT->new(%mqtt_conf);;
+    $mqtt->publish(
+	topic => $mqtt_conf{will_topic},
+	retain => 1,
+	message => encode_json({
+	    state => q(alive),
+	}),
+    );
+}
+connect_mqtt;
+
+my $inotify = new Linux::Inotify2 or
+    die "unable to create new inotify object: $!\n";
+
+$inotify->watch($conf{base_dir}, IN_ONLYDIR | IN_MOVED_TO, sub {
+    my $e = shift;
+    my $fn = $e->fullname;
+
+    publish_json( do { local(@ARGV, $/) = $fn; <> || ''} );
+    unlink($fn);
+ });
+
+my $inot = AnyEvent->io(
+    fh => $inotify->fileno,
+    poll => 'r',
+    cb => sub {
+	$inotify->poll;
+    });
+
+sub req_services {
+    my $conn = shift;
+    
+}
+
+my @queries = sort keys %query_conf;
+my %conns;
+foreach my $conn (keys %{ $conf{connections} }) {
+    $logger->notice("adding connection '$conn'");
+
+    $conns{$conn}->{query} = 0;
+
+    my ($host, $port) = parse_hostport($conf{connections}->{$conn}, 6557);
+    $conns{$conn}->{guard} = tcp_connect $host, $port, sub {
+	($conns{$conn}->{fh}, my $phost, my $pport) = @_;
+
+	unless($conns{$conn}->{fh}) {
+	    $logger->error("failed to connect to $host:$port: $!");
+	    return;
+	}
+	
+	$logger->notice("[$conn] connected to $phost:$pport");
+	$conns{$conn}->{handle} = new AnyEvent::Handle
+	    fh => $conns{$conn}->{fh},
+	    on_error => sub {
+		$logger->error("$_[2]");
+	    },
+	    on_eof => sub {
+	        $conns{$conn}->{handle}->destroy;
+		$logger->notice("EOF");
+	    };
+
+	$conns{$conn}->{handle}->on_read(
+	    sub {
+		# get header
+		shift->unshift_read(
+		    chunk => 16,
+		    sub {
+			my $header = $_[1];
+			$logger->notice("[$conn] HEADER: $header");
+			if($header =~ /^(\d+)\s+(\d+)/) {
+			    my ($code, $len) = ($1, $2);
+
+			    shift->unshift_read(
+				chunk => $len,
+				sub {
+				    my $payload = decode_json($_[1]);
+				    my @payload;
+				    foreach my $row (@$payload) {
+					my %row;
+					foreach my $col (@{ $cols_conf{$queries[ $conns{$conn}->{query} ]} }) {
+					    $row{$col} = shift(@$row);
+					}
+					push(@payload, \%row);
+				    }
+				    
+				    publish_json($conn, $queries[ $conns{$conn}->{query} ], encode_json(\@payload));
+
+				    $conns{$conn}->{query} = ($conns{$conn}->{query} + 1) % scalar @queries;
+				});
+			}
+		    });
+	    });
+	$logger->notice(rand($conf{interval}));
+	$conns{$conn}->{timer} = AnyEvent->timer(
+	    after => rand($conf{interval}),
+	    interval => $conf{interval}, cb => sub {
+		$logger->notice("[$conn] TIMER");
+
+		$conns{$conn}->{handle}->push_write($query_conf{$queries[ $conns{$conn}->{query} ]}->{req});
+		return 0;
+	    });
+    };
+}
+
+sub publish_json {
+    my ($conn, $query, $json) = @_;
+
+    # MQTT available?
+    return unless($mqtt);
+
+    # build topic
+    my $topic = join('/', $conf{base_topic}, $conn, $query);
+    
+    # strip invalid utf8 stuff
+    $json =~ s/[^[:print:]\s]//g;
+
+    $mqtt->publish(
+	topic => $topic,
+	message => $json,
+	);
+
+    print "PUB: $topic\n";
+}
+
+
+$logger->notice("entering event loop");
+$cv{quit}->recv;
