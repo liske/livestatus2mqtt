@@ -1,0 +1,19 @@
+#!/usr/bin/python
+
+import re
+import sys
+reload(sys)
+sys.setdefaultencoding('utf-8')
+
+if len(sys.argv) != 2:
+    print('Usage: ' + sys.argv[0] + ' <sites.mk>')
+    exit(1)
+
+execfile(sys.argv[1])
+
+for site, opts in sites.items():
+    if opts['disabled']:
+	continue
+    socket = opts.get('socket', 'tcp:localhost')
+    socket = re.sub(r'^tcp:', '', socket)
+    print(u'$conf{connections}->{q(%s)} = q(%s);' % (opts['alias'], socket));
