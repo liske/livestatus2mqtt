@@ -280,6 +280,7 @@ sub req_services {
 }
 
 my @queries = sort keys %query_conf;
+my %results = map { $_ => {}; } keys %query_conf;
 my %conns;
 foreach my $conn (keys %{ $conf{connections} }) {
     $logger->notice("adding connection '$conn'");
@@ -330,7 +331,7 @@ foreach my $conn (keys %{ $conf{connections} }) {
 					push(@payload, \%row);
 				    }
 				    
-				    publish_json($conn, $queries[ $conns{$conn}->{query} ], encode_json(\@payload));
+				    publish_json($conn, $queries[ $conns{$conn}->{query} ], @payload);
 
 				    $conns{$conn}->{query} = ($conns{$conn}->{query} + 1) % scalar @queries;
 				});
@@ -350,14 +351,20 @@ foreach my $conn (keys %{ $conf{connections} }) {
 }
 
 sub publish_json {
-    my ($conn, $query, $json) = @_;
+    my ($conn, $query, @payload) = @_;
+
+    $results{$query}->{$conn} = \@payload;
 
     # MQTT available?
     return unless($mqtt);
 
     # build topic
-    my $topic = join('/', $conf{base_topic}, $conn, $query);
-    
+    my $topic = join('/', $conf{base_topic}, $query);
+
+    # join lists and convert to json
+    my @result = map { @{ $results{$query}->{$_} }; } keys %{ $results{$query} };
+    my $json = encode_json(\@result);
+
     # strip invalid utf8 stuff
     $json =~ s/[^[:print:]\s]//g;
 
