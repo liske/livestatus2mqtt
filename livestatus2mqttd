@@ -55,7 +55,7 @@ my %conf = (
     connections => {
 	q(localhost) => q(localhost),
     },
-    base_topic => q(livestatus),
+    base_topic => q(livestatus/).hostname,
     interval => 20,
 );
 
@@ -145,7 +145,7 @@ my $mqtt;
 my %mqtt_conf = (
     host => q(localhost),
 
-    will_topic => join('/', $conf{base_topic}, q(daemons), hostname),
+    will_topic => join('/', $conf{base_topic}, q(daemon)),
     will_retain => 1,
     will_message => encode_json({
 	state => q(dead),
